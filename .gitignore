@@ -3,4 +3,11 @@ __pycache__/
 *.pyc
 .vscode/
 .env
+tarjeta_dgii.json
 *.log
+build/
+dist/
+_herramientas/
+instalador/
+_tmp_check.ps1
+*.spec.bak

@@ -24,12 +24,26 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Al estar compilado con PyInstaller, el Chromium se empaqueta dentro de la
+# propia carpeta del programa; esta variable le indica a Playwright que lo
+# busque ahí (y no en AppData del equipo, donde no existirá).
+if getattr(sys, "frozen", False):
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+else:
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+
 from dotenv import load_dotenv
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 
 # --- Configuración -----------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
+# Compilado con PyInstaller, __file__ apunta a una carpeta temporal de extracción;
+# por eso, si está "congelado", se usa la carpeta donde vive el .exe (ahí se
+# colocan .env y tarjeta_dgii.json).
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 URL_LOGIN = "https://www.dgii.gov.do/OFV/login.aspx"
 
 # Selectores (con alternativas por si la DGII cambia ligeramente los IDs)
@@ -47,6 +61,7 @@ SELECTORES_CLAVE = [
     "input[type='password']",
 ]
 XPATH_BOTON_ENTRAR = '//*[@id="ctl00_ContentPlaceHolder1_BtnAceptar"]'
+XPATH_BOTON_SALIR = '//*[@id="menus"]/li[5]/a'
 XPATH_BOTON_CONTINUAR = '//*[@id="ctl00_ContentPlaceHolder1_BtnAceptarTarjetaToken"]'
 SELECTOR_TARJETA = "#ctl00_ContentPlaceHolder1_txtpasscodeTarjetaToken"
 
@@ -62,8 +77,21 @@ class ErrorLoginDGII(Exception):
 
 
 # --- Utilidades --------------------------------------------------------------
+# La consola de Windows (cp1252) no puede imprimir emojis; se sustituyen por
+# '?' en vez de provocar un fallo.
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(errors="replace")
+
+
+_gancho_log = None  # la interfaz gráfica lo usa para mostrar el estado
+
+
 def log(mensaje: str) -> None:
     print(f"[{datetime.now():%H:%M:%S}] {mensaje}", flush=True)
+    if _gancho_log:
+        _gancho_log(mensaje)
 
 
 def cargar_configuracion() -> tuple[str, str, Path]:
@@ -98,7 +126,7 @@ def cargar_tarjeta(ruta: Path) -> dict[str, str]:
     # Aviso de permisos inseguros (solo en sistemas POSIX)
     es_posix = os.name == "posix"
     if es_posix and (ruta.stat().st_mode & 0o077):
-        log(f"⚠️  Permisos inseguros en {ruta.name}. Recomendado: chmod 600 {ruta.name}")
+        log(f"[AVISO] Permisos inseguros en {ruta.name}. Recomendado: chmod 600 {ruta.name}")
     return tarjeta
 
 
@@ -174,104 +202,191 @@ async def detectar_error_en_pagina(page: Page) -> str | None:
 
 
 # --- Flujo principal ---------------------------------------------------------
-async def login(headless: bool) -> int:
+async def probar_navegador() -> int:
+    """Autoprueba: verifica que Chromium empaquetado inicie correctamente."""
+    async with async_playwright() as p:
+        navegador = await p.chromium.launch(headless=True)
+        pagina = await navegador.new_page()
+        await pagina.goto("about:blank")
+        await navegador.close()
+    log("[OK] Autoprueba superada: Chromium funciona en este equipo.")
+    return 0
+
+
+class Sesion:
+    """Sesión de navegador abierta en la Oficina Virtual."""
+
+    def __init__(self, playwright, navegador, contexto, page: Page) -> None:
+        self.playwright = playwright
+        self.navegador = navegador
+        self.contexto = contexto
+        self.page = page
+
+    async def cerrar_navegador(self) -> None:
+        try:
+            await self.navegador.close()
+        except PlaywrightError:
+            pass
+        try:
+            await self.playwright.stop()
+        except PlaywrightError:
+            pass
+
+
+async def iniciar_sesion(headless: bool) -> Sesion:
+    """Hace el login completo y deja el navegador ABIERTO para que el usuario trabaje."""
     usuario, clave, ruta_tarjeta = cargar_configuracion()
     tarjeta = cargar_tarjeta(ruta_tarjeta)
     log(f"Tarjeta cargada: {len(tarjeta)} posiciones desde {ruta_tarjeta.name}")
 
-    async with async_playwright() as p:
+    p = await async_playwright().start()
+    navegador = None
+    try:
         navegador = await p.chromium.launch(headless=headless)
         contexto = await navegador.new_context(locale="es-DO", viewport={"width": 1280, "height": 900})
         page = await contexto.new_page()
         page.set_default_timeout(TIMEOUT_MS)
 
-        try:
-            # ---------------- Paso 0: abrir la página ----------------
-            log(f"Abriendo {URL_LOGIN} ...")
-            await page.goto(URL_LOGIN, wait_until="domcontentloaded")
+        # ---------------- Paso 0: abrir la página ----------------
+        log(f"Abriendo {URL_LOGIN} ...")
+        await page.goto(URL_LOGIN, wait_until="domcontentloaded")
 
-            # ---------------- Paso 1: Usuario + Clave ----------------
-            campo_usuario = await primer_selector_visible(page, SELECTORES_USUARIO, "Usuario")
-            campo_clave = await primer_selector_visible(page, SELECTORES_CLAVE, "Clave")
-            await campo_usuario.fill(usuario)
-            await campo_clave.fill(clave)
-            log("Usuario y clave ingresados.")
+        # ---------------- Paso 1: Usuario + Clave ----------------
+        campo_usuario = await primer_selector_visible(page, SELECTORES_USUARIO, "Usuario")
+        campo_clave = await primer_selector_visible(page, SELECTORES_CLAVE, "Clave")
+        await campo_usuario.fill(usuario)
+        await campo_clave.fill(clave)
+        log("Usuario y clave ingresados.")
 
-            campo_tarjeta = page.locator(SELECTOR_TARJETA)
-            boton = page.locator(f"xpath={XPATH_BOTON_ENTRAR}")
+        campo_tarjeta = page.locator(SELECTOR_TARJETA)
+        boton = page.locator(f"xpath={XPATH_BOTON_ENTRAR}")
 
-            # Algunas versiones de la OFV muestran el campo Tarjeta desde el inicio.
-            tarjeta_ya_visible = await campo_tarjeta.count() and await campo_tarjeta.is_visible()
-            if not tarjeta_ya_visible:
-                log("Haciendo clic en 'Entrar' (paso 1)...")
-                await boton.click()
-                try:
-                    await campo_tarjeta.wait_for(state="visible", timeout=TIMEOUT_MS)
-                except PlaywrightTimeoutError:
-                    msg = await detectar_error_en_pagina(page)
-                    raise ErrorLoginDGII(
-                        "No apareció el campo Tarjeta tras el paso 1. "
-                        + (f"Mensaje de la DGII: '{msg}'" if msg else "Verifique usuario y clave.")
-                    )
-
-            # ---------------- Paso 2: Tarjeta de coordenadas ----------------
-            texto = await leer_texto_tooltip(page)
-            log(f"Texto del tooltip: '{texto}'")
-            posicion = extraer_posicion(texto)
-            codigo = obtener_codigo(tarjeta, posicion)
-            log(f"Posición solicitada: {posicion} → código encontrado (oculto: {'*' * len(codigo)}).")
-
-            await campo_tarjeta.fill(codigo)
-
-            log("Enviando formulario...")
-            url_antes = page.url
-            boton_continuar = page.locator(f"xpath={XPATH_BOTON_CONTINUAR}")
-            if not await boton_continuar.count():
-                boton_continuar = boton
-            await boton_continuar.click()
+        # Algunas versiones de la OFV muestran el campo Tarjeta desde el inicio.
+        tarjeta_ya_visible = await campo_tarjeta.count() and await campo_tarjeta.is_visible()
+        if not tarjeta_ya_visible:
+            log("Haciendo clic en 'Entrar' (paso 1)...")
+            await boton.click()
             try:
-                await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+                await campo_tarjeta.wait_for(state="visible", timeout=TIMEOUT_MS)
             except PlaywrightTimeoutError:
-                log("⚠️  La página tardó en estabilizarse; se continúa con la verificación.")
-
-            # ---------------- Verificación ----------------
-            error = await detectar_error_en_pagina(page)
-            sigue_en_login = "login.aspx" in page.url.lower() and await campo_tarjeta.count() > 0
-            if error or sigue_en_login:
+                msg = await detectar_error_en_pagina(page)
                 raise ErrorLoginDGII(
-                    "El login no se completó. "
-                    + (f"Mensaje de la DGII: '{error}'" if error else f"Se permanece en {url_antes}.")
+                    "No apareció el campo Tarjeta tras el paso 1. "
+                    + (f"Mensaje de la DGII: '{msg}'" if msg else "Verifique usuario y clave.")
                 )
 
-            log(f"✅ Login exitoso. URL actual: {page.url}")
-            if not headless:
-                log("El navegador permanecerá abierto. Presione Ctrl+C para cerrar.")
-                try:
-                    await page.wait_for_event("close", timeout=0)
-                except (PlaywrightError, asyncio.CancelledError):
-                    pass
-            return 0
+        # ---------------- Paso 2: Tarjeta de coordenadas ----------------
+        texto = await leer_texto_tooltip(page)
+        log(f"Texto del tooltip: '{texto}'")
+        posicion = extraer_posicion(texto)
+        codigo = obtener_codigo(tarjeta, posicion)
+        log(f"Posición solicitada: {posicion} → código encontrado (oculto: {'*' * len(codigo)}).")
 
-        except PlaywrightTimeoutError as e:
-            raise ErrorLoginDGII(f"Tiempo de espera agotado: {e}") from e
-        finally:
+        await campo_tarjeta.fill(codigo)
+
+        log("Enviando formulario...")
+        url_antes = page.url
+        boton_continuar = page.locator(f"xpath={XPATH_BOTON_CONTINUAR}")
+        if not await boton_continuar.count():
+            boton_continuar = boton
+        await boton_continuar.click()
+        try:
+            await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            log("[AVISO] La página tardó en estabilizarse; se continúa con la verificación.")
+
+        # ---------------- Verificación ----------------
+        error = await detectar_error_en_pagina(page)
+        sigue_en_login = "login.aspx" in page.url.lower() and await campo_tarjeta.count() > 0
+        if error or sigue_en_login:
+            raise ErrorLoginDGII(
+                "El login no se completó. "
+                + (f"Mensaje de la DGII: '{error}'" if error else f"Se permanece en {url_antes}.")
+            )
+
+        log(f"[OK] Login exitoso. URL actual: {page.url}")
+        return Sesion(p, navegador, contexto, page)
+
+    except PlaywrightTimeoutError as e:
+        await _limpiar(p, navegador)
+        raise ErrorLoginDGII(f"Tiempo de espera agotado: {e}") from e
+    except BaseException:
+        await _limpiar(p, navegador)
+        raise
+
+
+async def _limpiar(p, navegador) -> None:
+    if navegador is not None:
+        try:
             await navegador.close()
+        except PlaywrightError:
+            pass
+    try:
+        await p.stop()
+    except PlaywrightError:
+        pass
+
+
+async def salir_de_oficina_virtual(sesion: Sesion) -> None:
+    """Pulsa 'Salir' en el menú de la OFV (XPATH_BOTON_SALIR) y cierra el navegador."""
+    try:
+        # El usuario puede haber abierto otras pestañas: se busca el menú en cualquiera.
+        paginas = [pg for pg in reversed(sesion.contexto.pages) if not pg.is_closed()]
+        salio = False
+        for pg in paginas:
+            enlace = pg.locator(f"xpath={XPATH_BOTON_SALIR}")
+            if await enlace.count():
+                log("Haciendo clic en 'Salir' de la Oficina Virtual...")
+                await enlace.first.click(timeout=10_000)
+                try:
+                    await pg.wait_for_load_state("networkidle", timeout=10_000)
+                except PlaywrightTimeoutError:
+                    pass
+                salio = True
+                break
+        if not salio:
+            log("[AVISO] No se encontró el botón 'Salir' en la página actual; se cierra el navegador.")
+    except PlaywrightError as e:
+        log(f"[AVISO] No se pudo pulsar 'Salir': {e}")
+    finally:
+        await sesion.cerrar_navegador()
+        log("Navegador cerrado.")
+
+
+async def login(headless: bool) -> int:
+    """Modo consola: login y espera a que el usuario cierre el navegador."""
+    sesion = await iniciar_sesion(headless)
+    if not headless:
+        log("El navegador permanecerá abierto. Presione Ctrl+C para cerrar.")
+        try:
+            await sesion.page.wait_for_event("close", timeout=0)
+        except (PlaywrightError, asyncio.CancelledError):
+            pass
+    await sesion.cerrar_navegador()
+    return 0
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Login automático en la OFV de la DGII.")
     parser.add_argument("--headless", action="store_true", help="Ejecutar sin mostrar el navegador")
+    parser.add_argument(
+        "--probar-navegador",
+        action="store_true",
+        help="Solo verifica que Chromium inicie correctamente y sale",
+    )
     args = parser.parse_args()
+    if args.probar_navegador:
+        sys.exit(asyncio.run(probar_navegador()))
     try:
         sys.exit(asyncio.run(login(args.headless)))
     except ErrorLoginDGII as e:
-        log(f"❌ {e}")
+        log(f"[ERROR] {e}")
         sys.exit(1)
     except KeyboardInterrupt:
         log("Proceso interrumpido por el usuario.")
         sys.exit(130)
     except PlaywrightError as e:
-        log(f"❌ Error de Playwright: {e}")
+        log(f"[ERROR] Error de Playwright: {e}")
         log("Sugerencia: ejecute 'playwright install chromium' si el navegador no está instalado.")
         sys.exit(1)
 

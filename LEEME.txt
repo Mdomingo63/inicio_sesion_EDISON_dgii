@@ -1,0 +1,33 @@
+LOGIN DGII EDISON - Automatización de inicio de sesión en la Oficina Virtual DGII
+==================================================================================
+
+QUÉ ES
+------
+Programa que abre la Oficina Virtual de la DGII, introduce el usuario, la
+clave y el código de la tarjeta de coordenadas automáticamente.
+
+CÓMO USARLO
+-----------
+1. Doble clic en "Login DGII" (menú Inicio o escritorio).
+2. Se abrirá una ventana negra con el registro del proceso y el navegador.
+3. Cuando termine, el navegador queda abierto en la sesión de la DGII.
+
+OPCIONES
+--------
+- Ejecutar sin mostrar el navegador:  LoginDGII.exe --headless
+- Probar que el navegador funciona:   LoginDGII.exe --probar-navegador
+
+ARCHIVOS DE CONFIGURACIÓN (en esta misma carpeta)
+-------------------------------------------------
+- .env                  → DGII_USUARIO y DGII_CLAVE (credenciales).
+- tarjeta_dgii.json     → Códigos de la tarjeta de coordenadas.
+
+Estos archivos contienen datos sensibles: NO compartirlos, NO subirlos a
+Internet ni enviarlos por correo.
+
+NOTAS
+-----
+- Al desinstalar el programa, las credenciales se conservan en esta carpeta.
+- Windows SmartScreen puede mostrar un aviso la primera vez por no ser un
+  programa firmado: pulsar "Más información" → "Ejecutar de todas formas".
+- Si el programa no inicia, verificar que estos dos archivos existan aquí.
